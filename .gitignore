@@ -1,0 +1,11 @@
+# Test and run residue
+node_modules/
+*.log
+bridge.json
+.installed.json
+
+# Editor and OS noise
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

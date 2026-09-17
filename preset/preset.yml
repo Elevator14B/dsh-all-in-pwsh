@@ -1,0 +1,2 @@
+name: All-in-Pwsh
+description: One persistent PowerShell 7 shell is the only tool the model can call directly; every other mounted tool is reached from that shell through a native PowerShell object interface.
