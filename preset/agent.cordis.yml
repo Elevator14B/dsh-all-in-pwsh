@@ -68,13 +68,13 @@
       config:
         timeoutMs: 300000
         description: |-
-          Run commands in a PowerShell shell
-          * When invoking this tool, the contents of the "command" parameter does NOT need to be XML-escaped.
-          * State is persistent across command calls and discussions with the user.
-          * This shell is also how you reach every other tool: the system prompt names the PowerShell commands (Invoke-DshTool, Get-DshTool, Get-DshToolSchema) that list, describe and call them.
-          * Use native Windows paths (C:\...) and $env:NAME variables; this is PowerShell, not bash.
-          * Please avoid commands that may produce a very large amount of output.
-          * Please run long lived commands in the background, e.g. 'Start-Job' or start a server with Start-Process.
+          Execute PowerShell code to orchestrate the session's tools in a persistent environment.
+          * Reach mounted capabilities with Invoke-DshTool / dsh-tool. Use PowerShell for variables, loops, branching, pipelines and in-memory transformation.
+          * For reading, writing, editing or searching task files use the read, write, edit, glob and grep tools. Do not substitute Get-Content, Set-Content, .NET or Python file I/O just to save calls.
+          * Native processes stay appropriate for real build, test and toolchain commands.
+          * Group related calls whose arguments are already known into one block. Dependencies can stay in one block whenever the code expresses them; return to the model when the next step needs judgment. Sequential nested calls are valid batching - no need to spawn workers for it, and each nested call has its own UI and log row.
+          * Retain variables and results, emit concise evidence, and do not truncate fields the next decision needs. Use -PassThru and explicit error checking, for example try/catch with -ErrorAction Stop where dependent actions must stop; do not continue past a failed prerequisite.
+          * Every nested call must finish before the block returns: the execution identity belongs to the block that started it.
 
     # The whole mode. It sits INSIDE this group because it drives the same
     # isolated `terminals` instance the shell tool uses: before each command

@@ -120,21 +120,31 @@ function summarize(description) {
 function renderReference(schemas, transport) {
   const others = schemas.filter(schema => schema.name !== transport)
   const lines = [
-    '## Calling tools from the shell',
-    '',
-    'The ' + TICK + transport + TICK + ' tool is the only tool you can call directly. Every other tool is reached through the PowerShell object interface this shell already has imported:',
-    '',
-    '    Invoke-DshTool -Name read -Arguments @{ file_path = \'C:\\work A\\note.txt\' }',
-    '    dsh-tool write @{ file_path = \'note.txt\'; content = \'line one\' }',
-    '    Get-DshTool                      # every callable tool',
-    '    Get-DshToolSchema -Name read     # that tool exact parameter schema',
-    '',
-    'Arguments are a PowerShell object: a hashtable, an ordered dictionary or a PSCustomObject. Never build JSON text, never escape quotes by hand, and never write an arguments file. An omitted -Arguments means an empty object. Nested hashtables and arrays, $null, $true/$false, integers, decimals, Unicode, newlines, quotes and backslashes all cross unchanged.',
-    '',
-    'The command prints the tool result text and returns normally on success. A tool failure writes a PowerShell error, so it is visible in this shell but does not end the session; use -ErrorAction Stop when you want it to terminate. Do not test success with $LASTEXITCODE. With -PassThru the command instead returns a structured object whose fields are Tool, Ok, IsError, Text, ErrorKind, Error, Call, Instance, Session and DurationMs, so you can branch on Ok.',
-    '',
-    'Run one call at a time: commands in this shell are serialized, and a call only works inside the shell command that started it. A background process started by an earlier command keeps that earlier identity and is refused.',
-    '',
+    "## Calling tools from the shell",
+    "",
+    "The `pwsh` tool is the only tool you can call directly: it runs PowerShell code in a persistent environment, and that code calls the session's other tools through the object interface this shell has imported.",
+    "",
+    "    Invoke-DshTool -Name read -Arguments @{ file_path = 'C:\\work\\note.txt' }",
+    "    dsh-tool write @{ file_path = 'note.txt'; content = 'line one' }",
+    "    Get-DshTool                      # every callable tool",
+    "    Get-DshToolSchema -Name read     # that tool's exact parameter schema",
+    "",
+    "Prefer this order when a step needs work:",
+    "",
+    "1. Reach mounted capabilities with `Invoke-DshTool` or `dsh-tool`. Use PowerShell for variables, loops, branching, pipelines and in-memory transformation.",
+    "2. For reading, writing, editing or searching task files use the `read`, `write`, `edit`, `glob` and `grep` tools. Do not substitute `Get-Content`, `Set-Content`, .NET or Python file I/O just to save calls.",
+    "3. Native processes stay appropriate for real build, test and toolchain commands.",
+    "",
+    "Group related calls whose arguments are already known into one block. Dependencies can stay in one block whenever the code expresses them; come back to the model when the next step needs judgment. Sequential nested calls are valid batching - no need to spawn workers for it - and each nested call has its own UI and log row. Retain variables and results, emit concise evidence, and do not truncate fields the next decision needs.",
+    "",
+    "Arguments are a PowerShell object: a hashtable, an ordered dictionary or a PSCustomObject. Never build JSON text, never escape quotes by hand, and never write an arguments file. An omitted -Arguments means an empty object. Nested hashtables and arrays, $null, $true/$false, integers, decimals, Unicode, newlines, quotes and backslashes all cross unchanged.",
+    "",
+    "The command prints the tool result text and returns normally on success. Use -PassThru and check errors explicitly: for example try/catch with -ErrorAction Stop where dependent actions must stop, and do not continue past a failed prerequisite.",
+    "",
+    "This is not a rule that everything must happen in one block: keep a step's work together when the code can express it, and return to the model when the next step needs a decision.",
+    "",
+    "Every nested call must finish before the block returns: the execution identity belongs to the block that started it, and work that outlives the block is refused.",
+    "",
   ]
   if (others.length === 0) {
     lines.push('No other tool is mounted in this composition.')
@@ -501,7 +511,7 @@ export function apply(ctx, config) {
   ctx.systemPrompt.section({
     name: 'dsh-all-in-pwsh:only',
     order: ctx.systemPrompt.getSectionOrder('PTC_ONLY'),
-    text: TICK + transport + TICK + ' is the only tool you can call directly - a tool call naming any other tool fails. Reach every other tool from inside that shell through the PowerShell object interface the reference below documents.',
+    text: TICK + transport + TICK + ' is the only tool you can call directly - a tool call naming any other tool fails. That code calls the other tools through the object interface the reference below documents.',
   })
 
   // 3. The catalog-derived reference, at the slot PTC mode's SDK uses.
