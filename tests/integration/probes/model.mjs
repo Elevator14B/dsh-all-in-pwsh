@@ -117,7 +117,7 @@ export function apply(ctx) {
 
     await turn([
       '授权测试。不要委派、不要浏览、不要访问当前工作目录以外的文件，不要改任何设置。',
-      '只使用 shell 里的 PowerShell 工具接口（Invoke-DshTool 或 dsh-tool 别名），参数一律用 PowerShell 对象，不要手写 JSON、不要用 --%、不要创建临时 JSON 文件。',
+      '只使用 shell 里的工具对象接口：Get-DshTool 取得工具对象，然后用 $tool.Invoke(@{ ... }) 调用，参数一律用 PowerShell 对象，不要手写 JSON、不要用 --%、不要创建临时 JSON 文件。',
       '请完成三件事：',
       '1) 建立目录 work A 中文。',
       '2) 用 write 写入 work A 中文' + String.fromCharCode(47) + '说明 note.txt，内容必须严格等于下面三行，一个字都不要改（注意双引号、撇号、反斜线、美元符号、反引号和 &）：',
@@ -131,7 +131,7 @@ export function apply(ctx) {
     record('model.wrote_exact_hostile_text', sameText(afterFirst, expectedFirst), { expected: expectedFirst, actual: afterFirst })
 
     await turn([
-      '授权测试，限制同上。只使用 PowerShell 工具接口和 PowerShell 参数对象。',
+      '授权测试，限制同上。只使用工具对象接口（Get-DshTool 取得对象，$tool.Invoke(@{ ... }) 调用）和 PowerShell 参数对象。',
       '1) 用 edit 把 work A 中文' + String.fromCharCode(47) + '说明 note.txt 里的第三行 line3 替换成 line3 换行后再加一行：' + appended,
       '2) 打印上一个命令里设置的变量 $global:KeepMe，证明 shell 状态跨命令保持。',
       '完成后停止。',
@@ -142,7 +142,7 @@ export function apply(ctx) {
 
     await turn([
       '授权测试，限制同上。',
-      '用 shell 里的 PowerShell 工具接口调用 read_image，读取 work A 中文' + String.fromCharCode(47) + 'swatch.png。',
+      '用 shell 里的工具对象接口调用 read_image（$img = Get-DshTool -Name read_image; $img.Invoke(@{ ... })），读取 work A 中文' + String.fromCharCode(47) + 'swatch.png。',
       '然后用一行简短回答：这张图的主要颜色是什么？请明确说出颜色词。完成后停止。',
     ].join(NL))
 
@@ -156,9 +156,12 @@ export function apply(ctx) {
     record('wire.only_shell_tool', requests.length > 0 && requests.every(names => names.length === 1 && names[0] === 'pwsh'), requests)
 
     const commands = events.filter(e => e.type === 'tool/call').map(e => { try { return JSON.parse(e.data.arguments).command } catch { return undefined } }).filter(c => typeof c === 'string')
-    const bridged = commands.filter(c => c.includes('Invoke-DshTool') || c.includes('dsh-tool'))
+    // The object interface is the taught path: obtain a handle, then call it with
+    // a PowerShell argument object. The compatibility entry points stay accepted.
+    const objectCalls = commands.filter(c => c.includes('.Invoke(@{') || c.includes('.TryInvoke(@{'))
+    const bridged = commands.filter(c => c.includes('Invoke-DshTool') || c.includes('dsh-tool') || objectCalls.includes(c))
     report.results.commands = commands
-    record('model.used_object_interface', bridged.length > 0 && bridged.every(c => c.includes('@{') || c.includes('Get-DshTool')), { total: commands.length, bridged: bridged.length, sample: bridged.slice(0, 3) })
+    record('model.used_object_interface', objectCalls.length > 0 && objectCalls.every(c => c.includes('@{')), { total: commands.length, objectCalls: objectCalls.length, bridged: bridged.length, sample: objectCalls.slice(0, 3) })
     record('model.no_json_workarounds', !commands.some(c => c.includes('ConvertTo-Json') || c.includes('--%')), commands.filter(c => c.includes('ConvertTo-Json') || c.includes('--%')).slice(0, 2))
     record('model.no_temp_json_files', readdirSync(dir).filter(name => name.endsWith('.json')).length === 0, readdirSync(dir))
 

@@ -1,5 +1,5 @@
 <#
-DshCli - the Windows tool entry for dsh-all-in-pwsh.
+DshCli - tool objects and result objects for dsh-all-in-pwsh.
 
 Every function here talks to the host bridge over HTTP with an explicit UTF-8
 JSON body. The per-execution identity (bridge path, call id and capability)
@@ -11,18 +11,19 @@ refused once that execution ends.
 An argument object is validated in its ORIGINAL form and serialized exactly
 once, as part of the request envelope. It is never round-tripped through
 ConvertFrom-Json, which would collide case-differing dictionary keys and coerce
-date-like strings.
+date-like strings. Replies are decoded by ConvertFrom-DshJson, which keeps
+strings as strings, keeps case-differing keys apart, and distinguishes a null
+value from an absent key.
 #>
-
-# Preferences stay with the caller: a tool failure writes an ErrorRecord that
-# the caller can turn into a terminating error with -ErrorAction Stop, and the
-# shell itself is never ended by a failed call.
 
 $script:DshCliBridgePath = $null
 $script:DshCliBridge = $null
 $script:DshCliClient = $null
 
 $script:DshCliMaxDepth = 48
+$script:DshCliMaxJsonDepth = 64
+
+# --- bridge rendezvous and client --------------------------------------------
 
 function Get-DshCliBridge {
     <#
@@ -41,7 +42,7 @@ function Get-DshCliBridge {
         if (-not (Test-Path -LiteralPath $path)) {
             throw [System.InvalidOperationException]::new("The bridge file named by DSH_PWSH_BRIDGE does not exist: $path")
         }
-        $script:DshCliBridge = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json
+        $script:DshCliBridge = ConvertFrom-DshJson -Json (Get-Content -LiteralPath $path -Raw -ErrorAction Stop)
         $script:DshCliBridgePath = $path
     }
     return $script:DshCliBridge
@@ -68,6 +69,90 @@ function New-DshCliClient {
     }
     return $script:DshCliClient
 }
+
+# --- exact JSON decoding ------------------------------------------------------
+
+function ConvertFrom-DshJsonValue {
+    <#
+    .SYNOPSIS
+    Convert one System.Text.Json element into PowerShell values without losing fidelity.
+
+    .DESCRIPTION
+    Objects become case-sensitive, order-preserving dictionaries so keys that
+    differ only in case stay apart, a null value is a present key holding
+    $null, arrays keep their length (including 1 and 0), numbers stay integers
+    when they fit and strings are never reinterpreted as dates.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Text.Json.JsonElement]$Element,
+        [Parameter(Mandatory)][int]$Depth
+    )
+
+    if ($Depth -gt $script:DshCliMaxJsonDepth) {
+        throw [System.InvalidOperationException]::new("The JSON value exceeds the maximum depth of $($script:DshCliMaxJsonDepth).")
+    }
+    $kind = $Element.ValueKind
+    if ($kind -eq [System.Text.Json.JsonValueKind]::Object) {
+        # Property access stays case-insensitive in the ordinary case, so
+        # $result.Value.Text reads the key the tool declared. An object whose
+        # keys differ only by case keeps BOTH keys and switches to exact lookup:
+        # there, an ambiguous key is read by index, never silently merged.
+        $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $ambiguous = $false
+        foreach ($property in $Element.EnumerateObject()) {
+            if (-not $seen.Add($property.Name)) { $ambiguous = $true; break }
+        }
+        $comparer = if ($ambiguous) { [System.StringComparer]::Ordinal } else { [System.StringComparer]::OrdinalIgnoreCase }
+        $map = [System.Collections.Specialized.OrderedDictionary]::new($comparer)
+        foreach ($property in $Element.EnumerateObject()) {
+            $map[$property.Name] = ConvertFrom-DshJsonValue -Element $property.Value -Depth ($Depth + 1)
+        }
+        return $map
+    }
+    if ($kind -eq [System.Text.Json.JsonValueKind]::Array) {
+        $items = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in $Element.EnumerateArray()) {
+            $items.Add((ConvertFrom-DshJsonValue -Element $item -Depth ($Depth + 1)))
+        }
+        # The unary comma keeps the array one pipeline object, so an empty or
+        # single-element array stays an array at the assignment site.
+        return ,$items.ToArray()
+    }
+    if ($kind -eq [System.Text.Json.JsonValueKind]::String) { return $Element.GetString() }
+    if ($kind -eq [System.Text.Json.JsonValueKind]::Number) {
+        $asLong = [int64]0
+        if ($Element.TryGetInt64([ref]$asLong)) { return $asLong }
+        $asDecimal = [decimal]0
+        if ($Element.TryGetDecimal([ref]$asDecimal)) { return $asDecimal }
+        return $Element.GetDouble()
+    }
+    if ($kind -eq [System.Text.Json.JsonValueKind]::True) { return $true }
+    if ($kind -eq [System.Text.Json.JsonValueKind]::False) { return $false }
+    return $null
+}
+
+function ConvertFrom-DshJson {
+    <#
+    .SYNOPSIS
+    Decode one JSON document with ConvertFrom-DshJsonValue's fidelity rules.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+
+    $document = $null
+    try {
+        $document = [System.Text.Json.JsonDocument]::Parse($Json)
+        # The unary comma keeps a top-level array one pipeline object: without it a
+        # root [] arrives as $null and a root [1] unwraps to a scalar.
+        return ,(ConvertFrom-DshJsonValue -Element $document.RootElement -Depth 1)
+    }
+    finally {
+        if ($null -ne $document) { $document.Dispose() }
+    }
+}
+
+# --- argument validation ------------------------------------------------------
 
 function Test-DshCliScalar {
     <#
@@ -199,10 +284,12 @@ function Test-DshCliArguments {
     return $Value
 }
 
+# --- the bridge request -------------------------------------------------------
+
 function Invoke-DshCliRpc {
     <#
     .SYNOPSIS
-    Send one request to the host bridge and return its parsed reply.
+    Send one request to the host bridge and return its decoded reply.
 
     .DESCRIPTION
     The payload carries the caller's argument object in its original form and is
@@ -211,8 +298,8 @@ function Invoke-DshCliRpc {
 
     Throws for anything that is not an answered request: a missing execution
     identity, an unreachable endpoint, a non-200 status or an unreadable body.
-    A tool-level failure is NOT thrown here; it comes back as a reply field so
-    the caller can raise it with the tool context intact.
+    A refused or failed operation is NOT thrown here; it comes back decoded so
+    the caller can shape it into one result object.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][System.Collections.IDictionary]$Payload)
@@ -230,7 +317,7 @@ function Invoke-DshCliRpc {
     }
 
     $envelope = [ordered]@{
-        instance   = $bridge.instance
+        instance   = $bridge['instance']
         session    = $session
         call       = $call
         capability = $capability
@@ -238,11 +325,11 @@ function Invoke-DshCliRpc {
     foreach ($key in $Payload.Keys) { $envelope[$key] = $Payload[$key] }
     $json = ConvertTo-Json -InputObject $envelope -Depth ($script:DshCliMaxDepth + 2) -Compress
 
-    $uri = 'http://127.0.0.1:' + $bridge.port + '/rpc'
+    $uri = 'http://127.0.0.1:' + $bridge['port'] + '/rpc'
     $request = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uri)
     $response = $null
     try {
-        $request.Headers.Add('x-dsh-cli-token', [string]$bridge.token)
+        $request.Headers.Add('x-dsh-cli-token', [string]$bridge['token'])
         $request.Content = [System.Net.Http.StringContent]::new($json, [System.Text.Encoding]::UTF8, 'application/json')
         $response = (New-DshCliClient).Send($request)
         $text = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
@@ -250,7 +337,7 @@ function Invoke-DshCliRpc {
     }
     catch [System.Net.Http.HttpRequestException] {
         throw [System.Net.Http.HttpRequestException]::new(
-            "The bridge at $uri is unreachable: $($_.Exception.Message). The host that owns this shell is gone or its bridge stopped.", $_.Exception)
+            "The bridge at $uri is unreachable: $($_.Exception.Message). The host that owns this shell is gone or its bridge stopped; a call that had already started may or may not have taken effect.", $_.Exception)
     }
     finally {
         if ($null -ne $response) { $response.Dispose() }
@@ -261,15 +348,396 @@ function Invoke-DshCliRpc {
         throw [System.InvalidOperationException]::new("The bridge answered HTTP $status for a request it should have accepted: $text")
     }
     try {
-        $reply = $text | ConvertFrom-Json
+        $reply = ConvertFrom-DshJson -Json $text
     }
     catch {
         throw [System.InvalidOperationException]::new("The bridge answered with unreadable JSON: $text")
     }
-    if ($reply.PSObject.Properties.Name -contains 'error') {
-        throw [System.InvalidOperationException]::new([string]$reply.error)
+    if ($null -eq $reply) {
+        throw [System.InvalidOperationException]::new('The bridge answered with an empty document.')
     }
     return $reply
+}
+
+# --- result and tool objects --------------------------------------------------
+
+class DshToolInfo {
+    <#
+    .SYNOPSIS
+    One catalog row: what a tool is called and what it is for.
+    #>
+    [string]$Name
+    [string]$Summary
+}
+
+class DshToolResult {
+    <#
+    .SYNOPSIS
+    The single object every tool call returns.
+
+    .DESCRIPTION
+    Printing it shows DisplayText; assigning it keeps the structured fields.
+    Value holds the tool's structured data (for read, the complete decoded text
+    of the requested scope), HasValue distinguishes "no structured value" from
+    "a value that is null", and Error is structured whenever Ok is false.
+    #>
+    [bool]$Ok
+    [bool]$HasValue
+    [object]$Value
+    [object]$Content
+    [string]$DisplayText
+    [object]$Error
+    [object]$Metadata
+}
+
+class DshTool {
+    <#
+    .SYNOPSIS
+    A reusable, callable tool: one definition fetched once, callable from any
+    later block of the same shell.
+
+    .DESCRIPTION
+    Property access is local and never talks to the bridge. Invoke, TryInvoke
+    and Refresh are the only members that execute anything; Invoke raises a
+    failure, TryInvoke returns it as a result object.
+    #>
+    [string]$Name
+    [string]$Summary
+    [string]$Description
+    [object]$InputSchema
+    [object]$OutputSchema
+    [object]$ReturnContract
+    [object]$Examples
+    [string]$DefinitionVersion
+    [string]$Instance
+    [string]$SessionId
+
+    [DshToolResult] Invoke([object]$Arguments) {
+        return (Invoke-DshToolObject -Tool $this -Arguments $Arguments -Raise)
+    }
+
+    [DshToolResult] TryInvoke([object]$Arguments) {
+        return (Invoke-DshToolObject -Tool $this -Arguments $Arguments)
+    }
+
+    [DshTool] Refresh() {
+        return (Get-DshTool -Name $this.Name)
+    }
+}
+
+function Test-DshCliEnvelopeRefusal {
+    <#
+    .SYNOPSIS
+    Whether one bridge reply is a refusal rather than a tool result.
+
+    .DESCRIPTION
+    A refusal carries a string `error` and no `ok` field. A call reply always
+    carries `ok`, and its `error` is a structured object or null, so the two can
+    never be confused by key presence alone.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Reply)
+
+    if (-not $Reply.Contains('error')) { return $false }
+    if ($Reply['error'] -isnot [string]) { return $false }
+    if ([string]::IsNullOrEmpty([string]$Reply['error'])) { return $false }
+    return (-not $Reply.Contains('ok'))
+}
+
+function New-DshToolResult {
+    <#
+    .SYNOPSIS
+    Shape one bridge reply into the single result object.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Reply,
+        [Parameter(Mandatory)][string]$Tool
+    )
+
+    $result = [DshToolResult]::new()
+    $result.Ok = [bool]$Reply['ok']
+    $result.HasValue = [bool]$Reply['hasValue']
+    $result.Value = $null
+    if ($result.HasValue -and $Reply.Contains('valueJson') -and ($Reply['valueJson'] -is [string])) {
+        $result.Value = ConvertFrom-DshJson -Json ([string]$Reply['valueJson'])
+    }
+    # Direct assignments, never an if-expression: PowerShell enumerates an
+    # if-expression's output, which would turn zero blocks into $null and a
+    # single block into the block itself instead of a one-element array.
+    $result.DisplayText = ''
+    if ($Reply.Contains('displayText') -and $null -ne $Reply['displayText']) {
+        $result.DisplayText = [string]$Reply['displayText']
+    }
+    $result.Content = @()
+    if ($Reply.Contains('content') -and $null -ne $Reply['content']) {
+        $blocks = $Reply['content']
+        if (($blocks -is [System.Collections.IEnumerable]) -and -not ($blocks -is [string])) {
+            $result.Content = $blocks
+        }
+        else {
+            $result.Content = @($blocks)
+        }
+    }
+    $result.Error = $null
+    if ($Reply.Contains('error')) { $result.Error = $Reply['error'] }
+    $result.Metadata = $null
+    if ($Reply.Contains('metadata')) { $result.Metadata = $Reply['metadata'] }
+    if (-not $result.Ok -and $null -eq $result.Error) {
+        $result.Error = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)
+        $result.Error['kind'] = 'Bridge'
+        $result.Error['code'] = $null
+        $result.Error['message'] = 'the bridge returned no error detail for this call'
+        $result.Error['tool'] = $Tool
+        $result.Error['parameterPath'] = $null
+    }
+    return $result
+}
+
+function New-DshToolFailure {
+    <#
+    .SYNOPSIS
+    One result object describing a refusal that never reached a tool execution.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter()][AllowNull()][object]$Code,
+        [Parameter()][AllowNull()][string]$ParameterPath,
+        [Parameter()][string]$Outcome = 'not-executed'
+    )
+
+    $result = [DshToolResult]::new()
+    $result.Ok = $false
+    $result.HasValue = $false
+    $result.Value = $null
+    $result.DisplayText = ''
+    $result.Content = @()
+    $error = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)
+    $error['kind'] = $Kind
+    $error['code'] = $Code
+    $error['message'] = $Message
+    $error['tool'] = $Tool
+    $error['parameterPath'] = $ParameterPath
+    $result.Error = $error
+    $metadata = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::Ordinal)
+    $metadata['tool'] = $Tool
+    $metadata['callId'] = $null
+    $metadata['rootCallId'] = $null
+    $metadata['parentCallId'] = $null
+    $metadata['session'] = $env:DSH_SESSION_ID
+    $metadata['instance'] = $null
+    $metadata['durationMs'] = 0
+    $metadata['definitionVersion'] = $null
+    $metadata['outcome'] = $Outcome
+    $result.Metadata = $metadata
+    return $result
+}
+
+function Get-DshTool {
+    <#
+    .SYNOPSIS
+    List the session's tools, or obtain reusable tool objects for named tools.
+
+    .DESCRIPTION
+    Without -Name this returns one DshToolInfo per mounted tool: Name and
+    Summary only, for discovery. With -Name it returns one DshTool object per
+    requested name, in the order given; the definition is fetched once, here,
+    and property access afterwards is local. A name that is not mounted fails
+    explicitly instead of returning nothing.
+
+    Print a returned tool object to see its parameters, its return contract and
+    a short validated example; keep the variable to call it from any later
+    block.
+
+    .PARAMETER Name
+    One or more exact tool names.
+
+    .EXAMPLE
+    Get-DshTool
+
+    .EXAMPLE
+    $read, $write = Get-DshTool -Name read, write
+    #>
+    [CmdletBinding()]
+    [OutputType([DshToolInfo])]
+    [OutputType([DshTool])]
+    param(
+        [Parameter(Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Name
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('Name')) {
+        $reply = Invoke-DshCliRpc -Payload ([ordered]@{ op = 'list' })
+        if ((Test-DshCliEnvelopeRefusal -Reply $reply)) {
+            throw [System.InvalidOperationException]::new([string]$reply['error'])
+        }
+        foreach ($tool in $reply['tools']) {
+            $info = [DshToolInfo]::new()
+            $info.Name = [string]$tool['name']
+            $info.Summary = [string]$tool['summary']
+            $info
+        }
+        return
+    }
+
+    $reply = Invoke-DshCliRpc -Payload ([ordered]@{ op = 'get'; names = $Name })
+    if ((Test-DshCliEnvelopeRefusal -Reply $reply)) {
+        throw [System.InvalidOperationException]::new([string]$reply['error'])
+    }
+    $instance = [string](Get-DshCliBridge)['instance']
+    foreach ($detail in $reply['tools']) {
+        $tool = [DshTool]::new()
+        $tool.Name = [string]$detail['name']
+        $tool.Summary = [string]$detail['summary']
+        $tool.Description = [string]$detail['description']
+        $tool.InputSchema = $detail['inputSchema']
+        $tool.OutputSchema = $detail['outputSchema']
+        $tool.ReturnContract = $detail['returnContract']
+        $tool.Examples = $detail['examples']
+        $tool.DefinitionVersion = [string]$detail['definitionVersion']
+        $tool.Instance = $instance
+        # Bound at creation: the handle belongs to this session and this bridge,
+        # and caches no execution capability.
+        $tool.SessionId = [string]$env:DSH_SESSION_ID
+        $tool
+    }
+}
+
+function Get-DshToolSchema {
+    <#
+    .SYNOPSIS
+    Return one tool's structured input schema.
+
+    .DESCRIPTION
+    Convenience entry point for (Get-DshTool -Name <name>).InputSchema. The
+    result is an object, not JSON text: address fields directly, or serialize it
+    explicitly with ConvertTo-Json when text is what you need.
+    #>
+    [CmdletBinding()]
+    [OutputType([object])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name
+    )
+
+    return (Get-DshTool -Name $Name).InputSchema
+}
+
+function Invoke-DshToolObject {
+    <#
+    .SYNOPSIS
+    Execute one tool object call and shape the reply into a result object.
+
+    .DESCRIPTION
+    The tool's cached definition version travels with the request, so a
+    definition that changed after the object was created is refused before
+    anything executes. Arguments are validated in their original form.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][DshTool]$Tool,
+        [Parameter()][AllowNull()][object]$Arguments,
+        [switch]$Raise
+    )
+
+    $bridge = Get-DshCliBridge
+    $currentInstance = [string]$bridge['instance']
+    # A handle bound to another bridge, or to another session, is host control
+    # flow: it is raised even from TryInvoke, so a script cannot branch past it.
+    if (-not [string]::IsNullOrEmpty($Tool.Instance) -and $Tool.Instance -ne $currentInstance) {
+        $message = "The tool object for '$($Tool.Name)' belongs to bridge instance $($Tool.Instance), but this shell is running under instance $currentInstance. A tool object is reusable across blocks of the session that created it and across no other; obtain a fresh object with Get-DshTool -Name $($Tool.Name)."
+        $record = [System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new($message),
+            'DshTool.Host.HANDLE_INSTANCE_MISMATCH',
+            [System.Management.Automation.ErrorCategory]::ConnectionError,
+            (New-DshToolFailure -Tool $Tool.Name -Kind 'Host' -Code 'HANDLE_INSTANCE_MISMATCH' -Message $message -Outcome 'not-executed'))
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+    $currentSession = [string]$env:DSH_SESSION_ID
+    if (-not [string]::IsNullOrEmpty($Tool.SessionId) -and $Tool.SessionId -ne $currentSession) {
+        $message = "The tool object for '$($Tool.Name)' belongs to session $($Tool.SessionId), but this shell is running in session $currentSession. A tool object is reusable across blocks of the session that created it and across no other; obtain a fresh object with Get-DshTool -Name $($Tool.Name)."
+        $record = [System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new($message),
+            'DshTool.Host.HANDLE_SESSION_MISMATCH',
+            [System.Management.Automation.ErrorCategory]::ConnectionError,
+            (New-DshToolFailure -Tool $Tool.Name -Kind 'Host' -Code 'HANDLE_SESSION_MISMATCH' -Message $message -Outcome 'not-executed'))
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+
+    # A rejected argument object is a call failure, not an escape from the
+    # result contract: TryInvoke reports it, Invoke raises it.
+    $validated = $null
+    try {
+        $validated = Test-DshCliArguments -Value $Arguments
+    }
+    catch {
+        if ($Raise) { throw }
+        return (New-DshToolFailure -Tool $Tool.Name -Kind 'Bridge' -Code 'INVALID_ARGUMENTS' -Message $_.Exception.Message -ParameterPath 'arguments' -Outcome 'not-executed')
+    }
+    $payload = [ordered]@{
+        op        = 'call'
+        name      = $Tool.Name
+        arguments = $validated
+    }
+    if (-not [string]::IsNullOrEmpty($Tool.DefinitionVersion)) {
+        $payload['definitionVersion'] = $Tool.DefinitionVersion
+    }
+
+    $reply = $null
+    $transportFailure = $null
+    try {
+        $reply = Invoke-DshCliRpc -Payload $payload
+    }
+    catch {
+        $transportFailure = $_
+    }
+
+    if ($null -ne $transportFailure) {
+        # The bridge never answered: the call may or may not have taken effect.
+        # This stays a result for TryInvoke, never a silent success.
+        $result = New-DshToolFailure -Tool $Tool.Name -Kind 'Bridge' -Code 'BRIDGE_UNREACHABLE' -Message $transportFailure.Exception.Message -Outcome 'unknown'
+        if (-not $Raise) { return $result }
+        throw [System.Net.Http.HttpRequestException]::new($result.Error['message'], $transportFailure.Exception)
+    }
+
+    # An envelope refusal is a string error on a reply that has no "ok" field;
+    # a call reply always carries "ok" and its own structured error object, so a
+    # tool failure is never mistaken for a transport refusal.
+    if ((Test-DshCliEnvelopeRefusal -Reply $reply)) {
+        $code = if ($reply.Contains('code')) { [string]$reply['code'] } else { $null }
+        # Host control flow - a revoked capability, an expired execution, a
+        # foreign bridge - is not an ordinary recoverable failure: it is raised
+        # even from TryInvoke so a script cannot branch past it.
+        $hostControl = $code -in @('IDENTITY_REVOKED', 'EXECUTION_ENDED', 'NO_CALL_IN_FLIGHT', 'NO_EXECUTION_IDENTITY', 'INSTANCE_MISMATCH', 'BAD_TOKEN')
+        $result = New-DshToolFailure -Tool $Tool.Name -Kind $(if ($hostControl) { 'Host' } else { 'Bridge' }) -Code $code -Message ([string]$reply['error']) -Outcome 'not-executed'
+        if ($hostControl -or $Raise) {
+            $record = [System.Management.Automation.ErrorRecord]::new(
+                [System.InvalidOperationException]::new($result.Error['message']),
+                "DshTool.$($result.Error['kind']).$code",
+                [System.Management.Automation.ErrorCategory]::ConnectionError,
+                $result)
+            $PSCmdlet.ThrowTerminatingError($record)
+        }
+        return $result
+    }
+
+    $result = New-DshToolResult -Reply $reply -Tool $Tool.Name
+    if (-not $result.Ok -and $Raise) {
+        $message = [string]$result.Error['message']
+        if ([string]::IsNullOrWhiteSpace($message)) { $message = "the call to '$($Tool.Name)' failed" }
+        $record = [System.Management.Automation.ErrorRecord]::new(
+            [System.InvalidOperationException]::new($message),
+            "DshTool.$($result.Error['kind'])",
+            [System.Management.Automation.ErrorCategory]::InvalidResult,
+            $result)
+        $PSCmdlet.ThrowTerminatingError($record)
+    }
+    return $result
 }
 
 function Invoke-DshTool {
@@ -278,32 +746,22 @@ function Invoke-DshTool {
     Call any tool mounted in this session from the shell.
 
     .DESCRIPTION
+    Convenience entry point for one call when no reusable tool object is needed.
+    It returns the same DshToolResult as $tool.Invoke(...), with the same error
+    policy: a failed call terminates the statement, so dependent work does not
+    run on missing data. Use TryInvoke on a tool object when a failure is an
+    expected branch.
+
     Arguments are a PowerShell object, not JSON text: pass a hashtable, an
     ordered dictionary or a PSCustomObject. Omit -Arguments to call a tool that
     takes none. Nested objects, arrays, null, booleans, numbers, Unicode,
     newlines, quotes and backslashes cross the bridge unchanged.
 
-    Without -PassThru the function writes the tool result text. With -PassThru
-    it writes a structured response object with these fields:
-
-      Tool        the tool that was called
-      Ok          $true when the host answered and the tool succeeded
-      IsError     the tool result's own error flag
-      Text        the tool result text, exactly as the model would see it
-      ErrorKind   $null, 'Protocol' (the bridge refused the request) or 'Tool'
-      Error       $null or the failure message
-      Call        the host call id this request was bound to
-      Instance    the instance that served it
-      Session     the session id
-      DurationMs  round-trip time in milliseconds
-
-    Failures are raised as PowerShell errors, so -ErrorAction Stop turns any of
-    them into a terminating error. Protocol failures and tool failures are
-    distinguished by ErrorKind and by the error category.
+    -PassThru is accepted for compatibility and changes nothing: every call
+    already returns the result object.
     #>
     [CmdletBinding()]
-    [OutputType([string])]
-    [OutputType([psobject])]
+    [OutputType([DshToolResult])]
     param(
         [Parameter(Mandatory, Position = 0)]
         [ValidateNotNullOrEmpty()]
@@ -315,105 +773,141 @@ function Invoke-DshTool {
         [switch]$PassThru
     )
 
-    $started = [System.Diagnostics.Stopwatch]::StartNew()
-    $failure = $null
-    $reply = $null
-    try {
-        $payload = [ordered]@{
-            op        = 'call'
-            name      = $Name
-            arguments = (Test-DshCliArguments -Value $Arguments)
-        }
-        $reply = Invoke-DshCliRpc -Payload $payload
+    $payload = [ordered]@{
+        op        = 'call'
+        name      = $Name
+        arguments = (Test-DshCliArguments -Value $Arguments)
     }
-    catch {
-        $failure = [pscustomobject]@{ Kind = 'Protocol'; Message = $_.Exception.Message }
+    $reply = Invoke-DshCliRpc -Payload $payload
+    if ((Test-DshCliEnvelopeRefusal -Reply $reply)) {
+        $message = [string]$reply['error']
+        throw [System.InvalidOperationException]::new($message)
     }
-    $started.Stop()
-
-    if ($null -ne $failure) {
-        $response = [pscustomobject]@{
-            Tool       = $Name
-            Ok         = $false
-            IsError    = $true
-            Text       = ''
-            ErrorKind  = 'Protocol'
-            Error      = $failure.Message
-            Call       = $env:DSH_PWSH_CALL
-            Instance   = $env:DSH_PWSH_BRIDGE
-            Session    = $env:DSH_SESSION_ID
-            DurationMs = [int]$started.ElapsedMilliseconds
-        }
-    }
-    else {
-        $response = [pscustomobject]@{
-            Tool       = $Name
-            Ok         = (-not [bool]$reply.isError)
-            IsError    = [bool]$reply.isError
-            Text       = [string]$reply.text
-            ErrorKind  = $null
-            Error      = $null
-            Call       = $env:DSH_PWSH_CALL
-            Instance   = (Get-DshCliBridge).instance
-            Session    = $env:DSH_SESSION_ID
-            DurationMs = [int]$started.ElapsedMilliseconds
-        }
-        if ($response.IsError) {
-            $response.ErrorKind = 'Tool'
-            $response.Error = $response.Text
-        }
-    }
-
-    if ($PassThru) { $response }
-
-    if ($response.IsError) {
-        $category = [System.Management.Automation.ErrorCategory]::InvalidResult
-        if ($response.ErrorKind -eq 'Protocol') { $category = [System.Management.Automation.ErrorCategory]::ConnectionError }
+    $result = New-DshToolResult -Reply $reply -Tool $Name
+    if (-not $result.Ok) {
+        $message = [string]$result.Error['message']
+        if ([string]::IsNullOrWhiteSpace($message)) { $message = "the call to '$Name' failed" }
         $record = [System.Management.Automation.ErrorRecord]::new(
-            [System.InvalidOperationException]::new($response.Error),
-            "DshTool.$($response.ErrorKind)",
-            $category,
-            $Name)
-        $PSCmdlet.WriteError($record)
-        return
+            [System.InvalidOperationException]::new($message),
+            "DshTool.$($result.Error['kind'])",
+            [System.Management.Automation.ErrorCategory]::InvalidResult,
+            $result)
+        $PSCmdlet.ThrowTerminatingError($record)
     }
-
-    if (-not $PassThru) { $response.Text }
-}
-
-function Get-DshTool {
-    <#
-    .SYNOPSIS
-    List every tool the bridge can run in this session.
-    #>
-    [CmdletBinding()]
-    [OutputType([psobject])]
-    param()
-
-    $reply = Invoke-DshCliRpc -Payload ([ordered]@{ op = 'list' })
-    foreach ($tool in $reply.tools) {
-        [pscustomobject]@{ Name = [string]$tool.name; Description = [string]$tool.description }
-    }
-}
-
-function Get-DshToolSchema {
-    <#
-    .SYNOPSIS
-    Print one tool's exact JSON parameter schema.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory, Position = 0)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name
-    )
-
-    $reply = Invoke-DshCliRpc -Payload ([ordered]@{ op = 'describe'; name = $Name })
-    return (ConvertTo-Json -InputObject $reply.schema -Depth $script:DshCliMaxDepth)
+    return $result
 }
 
 Set-Alias -Name dsh-tool -Value Invoke-DshTool -Force
+
+# --- type data and format views ----------------------------------------------
+
+# .Text stays as a display alias: it returns exactly what printing the result
+# shows, and it is never the data channel - use .Value for data.
+Update-TypeData -TypeName 'DshToolResult' -MemberType ScriptProperty -MemberName 'Text' -Value { $this.DisplayText } -Force
+
+# What printing shows: the tool's display text, or the failure message when the
+# call never produced one. The printed view is bounded independently of the
+# data: a generic tool that returns a very long display text is shortened here
+# only, and .DisplayText still holds every character the tool produced.
+Update-TypeData -TypeName 'DshToolResult' -MemberType ScriptProperty -MemberName 'ViewText' -Value {
+    $text = $this.DisplayText
+    if ([string]::IsNullOrEmpty($text)) {
+        if ($null -ne $this.Error) { return [string]$this.Error['message'] }
+        return ''
+    }
+    $limit = 12000
+    if ($text.Length -le $limit) { return $text }
+    return $text.Substring(0, $limit) + [char]10 + '... (display truncated at ' + $limit + ' characters; .DisplayText holds the full text and .Value holds the data)'
+} -Force
+
+# One status line: tool, outcome, and for a read the scope the value carries.
+Update-TypeData -TypeName 'DshToolResult' -MemberType ScriptProperty -MemberName 'StatusLine' -Value {
+    $metadata = $this.Metadata
+    $tool = if ($null -ne $metadata -and $metadata.Contains('tool')) { [string]$metadata['tool'] } else { 'tool' }
+    $parts = @($tool, $(if ($this.Ok) { 'ok' } else { 'failed' }))
+    if ($this.Ok) {
+        $value = $this.Value
+        if (-not $this.HasValue) { $parts += 'no structured value' }
+        elseif ($null -eq $value) { $parts += 'value is null' }
+        elseif ($value -is [System.Collections.IDictionary] -and $value.Contains('text')) {
+            $parts += ('text ' + ([string]$value['text']).Length + ' chars')
+            if ($value.Contains('totalLines')) { $parts += ([string]$value['totalLines'] + ' lines total') }
+            $parts += ('scope lines ' + [string]$value['offset'] + '-' + [string]$value['endLine'])
+        }
+        else { $parts += 'value present' }
+    }
+    else {
+        $error = $this.Error
+        if ($null -ne $error) {
+            if ($error.Contains('kind')) { $parts += [string]$error['kind'] }
+            if ($error.Contains('code') -and -not [string]::IsNullOrEmpty([string]$error['code'])) { $parts += [string]$error['code'] }
+        }
+    }
+    if ($null -ne $metadata -and $metadata.Contains('durationMs')) { $parts += ([string]$metadata['durationMs'] + ' ms') }
+    return ('[' + ($parts -join ' - ') + ']')
+} -Force
+
+# The compact parameter list a printed tool object shows.
+Update-TypeData -TypeName 'DshTool' -MemberType ScriptProperty -MemberName 'ParameterSummary' -Value {
+    $schema = $this.InputSchema
+    if ($null -eq $schema) { return '(no schema declared)' }
+    $properties = $schema['properties']
+    if ($null -eq $properties -or $properties.Count -eq 0) { return '(none)' }
+    $required = @($schema['required'])
+    $parts = @()
+    foreach ($key in $properties.Keys) {
+        $entry = $properties[$key]
+        $type = if ($null -ne $entry -and $entry.Contains('type') -and $null -ne $entry['type']) { [string]$entry['type'] } else { 'any' }
+        $parts += ($key + ': ' + $type + $(if ($required -contains $key) { ' (required)' } else { '' }))
+    }
+    return ($parts -join '; ')
+} -Force
+
+# What the tool returns, in one line, taken from its declared return contract.
+Update-TypeData -TypeName 'DshTool' -MemberType ScriptProperty -MemberName 'ReturnSummary' -Value {
+    $contract = $this.ReturnContract
+    if ($null -eq $contract) { return 'no return contract declared' }
+    $value = $contract['value']
+    $lines = @()
+    if ($null -ne $value) {
+        if ($value.Contains('text') -and $null -ne $value['text']) { $lines += [string]$value['text'] }
+        if ($value.Contains('note') -and $null -ne $value['note']) { $lines += [string]$value['note'] }
+        if ($value.Contains('schema') -and $null -ne $value['schema']) { $lines += 'value fields follow the declared output schema (see .OutputSchema)' }
+        if ($value.Contains('source') -and [string]$value['source'] -eq 'preset-read-contract') {
+            $lines += '.Value.Text is complete for the requested scope; the printed text may be a preview'
+        }
+    }
+    if ($contract.Contains('limits') -and $null -ne $contract['limits']) {
+        $limits = $contract['limits']
+        if ($limits.Contains('readFullMaxBytes')) { $lines += ('full read limit: ' + [string]$limits['readFullMaxBytes'] + ' bytes') }
+        elseif ($limits.Contains('fullReadMaxBytes')) { $lines += ('full read limit: ' + [string]$limits['fullReadMaxBytes'] + ' bytes') }
+    }
+    return ($lines -join '; ')
+} -Force
+
+# One validated usage line, from the tool's own examples when it has any.
+Update-TypeData -TypeName 'DshTool' -MemberType ScriptProperty -MemberName 'Usage' -Value {
+    $examples = $this.Examples
+    if ($null -ne $examples -and $examples.Count -gt 0) {
+        $arguments = $examples[0]['arguments']
+        if ($null -ne $arguments) {
+            $parts = @()
+            foreach ($key in $arguments.Keys) {
+                $value = $arguments[$key]
+                $rendered = if ($value -is [string]) { "'" + ([string]$value).Replace("'", "''") + "'" } else { [string]$value }
+                $parts += ($key + ' = ' + $rendered)
+            }
+            return ('$tool.Invoke(@{ ' + ($parts -join '; ') + ' })')
+        }
+    }
+    return ('$tool.Invoke(@{ ... })')
+} -Force
+
+$script:DshCliFormatPath = Join-Path $PSScriptRoot 'DshCli.format.ps1xml'
+if (Test-Path -LiteralPath $script:DshCliFormatPath) {
+    $known = @(Get-FormatData -TypeName 'DshTool' -ErrorAction SilentlyContinue)
+    if ($known.Count -eq 0) { Update-FormatData -PrependPath $script:DshCliFormatPath }
+}
 
 # Release the cached loopback client with the module rather than leaking it for
 # the life of the shell.
@@ -424,4 +918,4 @@ $ExecutionContext.SessionState.Module.OnRemove = {
     }
 }
 
-Export-ModuleMember -Function Invoke-DshTool, Get-DshTool, Get-DshToolSchema -Alias dsh-tool
+Export-ModuleMember -Function Get-DshTool, Get-DshToolSchema, Invoke-DshTool -Alias dsh-tool

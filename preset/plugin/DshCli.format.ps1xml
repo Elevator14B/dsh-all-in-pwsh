@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Display views for the dsh-all-in-pwsh object surface.
+
+  Catalog rows, tool objects and result objects share ONE view on purpose: the
+  default formatter selects a view from the first object in the pipeline, so
+  separate views would make a pipeline that mixes a tool object and its result
+  fall back to a raw property list - which is exactly the fallback that would
+  dump the complete .Value. The script blocks only read properties: printing a
+  tool object or a result never executes a tool and never touches the bridge.
+-->
+<Configuration>
+  <ViewDefinitions>
+    <View>
+      <Name>DshObjectView</Name>
+      <ViewSelectedBy>
+        <TypeName>DshToolInfo</TypeName>
+        <TypeName>DshTool</TypeName>
+        <TypeName>DshToolResult</TypeName>
+      </ViewSelectedBy>
+      <CustomControl>
+        <CustomEntries>
+          <CustomEntry>
+            <CustomItem>
+              <ExpressionBinding>
+                <ScriptBlock>
+                  $names = $_.PSObject.TypeNames
+                  if ($names -contains 'DshTool') {
+                    $_.Name + ' - ' + $_.Summary + [char]10 +
+                    'parameters: ' + $_.ParameterSummary + [char]10 +
+                    'returns: ' + $_.ReturnSummary + [char]10 +
+                    'usage: ' + $_.Usage + [char]10 +
+                    'definition ' + $_.DefinitionVersion + ' (call Refresh() after a definition change)' + [char]10 +
+                    'more: .Description, .InputSchema, .OutputSchema, .ReturnContract'
+                  }
+                  elseif ($names -contains 'DshToolResult') {
+                    $_.ViewText + [char]10 + $_.StatusLine
+                  }
+                  else {
+                    $_.Name + ' - ' + $_.Summary
+                  }
+                </ScriptBlock>
+              </ExpressionBinding>
+            </CustomItem>
+          </CustomEntry>
+        </CustomEntries>
+      </CustomControl>
+    </View>
+  </ViewDefinitions>
+</Configuration>

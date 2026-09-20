@@ -68,13 +68,13 @@
       config:
         timeoutMs: 300000
         description: |-
-          Execute PowerShell code to orchestrate the session's tools in a persistent environment.
-          * Reach mounted capabilities with Invoke-DshTool / dsh-tool. Use PowerShell for variables, loops, branching, pipelines and in-memory transformation.
-          * For reading, writing, editing or searching task files use the read, write, edit, glob and grep tools. Do not substitute Get-Content, Set-Content, .NET or Python file I/O just to save calls.
-          * Native processes stay appropriate for real build, test and toolchain commands.
-          * Group related calls whose arguments are already known into one block. Dependencies can stay in one block whenever the code expresses them; return to the model when the next step needs judgment. Sequential nested calls are valid batching - no need to spawn workers for it, and each nested call has its own UI and log row.
-          * Retain variables and results, emit concise evidence, and do not truncate fields the next decision needs. Use -PassThru and explicit error checking, for example try/catch with -ErrorAction Stop where dependent actions must stop; do not continue past a failed prerequisite.
-          * Every nested call must finish before the block returns: the execution identity belongs to the block that started it.
+          Execute PowerShell code to call tools and process their results in a persistent session.
+          * Keep variables, parsed data and tool objects for subsequent blocks and user turns.
+          * Get-DshTool -Name <names> returns callable objects; print selected objects for parameters and return contracts. Call $tool.Invoke(@{ ... }).
+          * Each call returns one result object. Printing shows a bounded preview; .Value holds data. A text read's .Value.Text is complete for the requested scope; never parse .DisplayText.
+          * Group known dependencies in one block, including computation, write and read-back verification. Pass computed variables onward; return to the model when new evidence requires a decision, not merely to move to the next known stage.
+          * Use mounted file tools for task files, including directory searches, PowerShell for computation, and native processes for builds/tests.
+          * Invoke failures stop dependent work. Use TryInvoke and check .Ok for expected failure branches. All nested calls must finish in this block.
 
     # The whole mode. It sits INSIDE this group because it drives the same
     # isolated `terminals` instance the shell tool uses: before each command
@@ -89,6 +89,11 @@
       name: './plugin/dsh-all-in-pwsh.mjs'
       config:
         transport: pwsh
+        # Ceiling for one complete read scope. A whole-file read over it fails
+        # with the provider's FS_TOO_LARGE, and a requested line range whose
+        # text exceeds it fails with a message; neither returns a prefix. An
+        # explicit range on a larger file is bounded by the range, not the file.
+        readFullMaxBytes: 8388608
 
 # ── everything else stays mounted ───────────────────────────────────────────
 

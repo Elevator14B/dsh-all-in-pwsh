@@ -7,7 +7,7 @@
  * they only run with --with-model.
  *
  * Usage:
- *   node tests/integration/run.cjs [--probe all|cold|lifecycle] [--with-model]
+ *   node tests/integration/run.cjs [--probe all|cold|objects|lifecycle] [--with-model]
  *   DSH_PROBE_RUNTIME=<app.asar/dsh> DSH_PROBE_EXE=<Electron exe> node run.cjs
  */
 const fs = require('node:fs')
@@ -21,6 +21,7 @@ const withModel = args.includes('--with-model')
 const requested = (args.find(a => a.startsWith('--probe=')) || '--probe=all').split('=')[1]
 const probes = [
   { name: 'cold', file: 'probes/cold.mjs', model: false, timeoutMs: 240000 },
+  { name: 'objects', file: 'probes/objects.mjs', model: false, timeoutMs: 900000 },
   { name: 'lifecycle', file: 'probes/lifecycle.mjs', model: false, timeoutMs: 420000 },
   { name: 'model', file: 'probes/model.mjs', model: true, timeoutMs: 900000 },
 ]
