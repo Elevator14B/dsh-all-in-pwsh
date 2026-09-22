@@ -66,6 +66,24 @@ export function apply(ctx) {
       })
     }
 
+    // A tool whose parameter schema is open at the root, exactly as the harness
+    // compiles a plugin's parameters: a name the schema does not declare is
+    // ignored by the harness rather than rejected.
+    const disposeDeclared = ctx.tools.register({
+      name: 'probe_declared',
+      description: 'Probe-only tool with declared parameters and an open root.',
+      parameters: {
+        type: 'object',
+        properties: {
+          note: { type: 'string', description: 'note to echo' },
+          count: { type: 'number', description: 'number to echo' },
+        },
+        required: ['note'],
+      },
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: String(value) }] },
+      async execute(args) { return String(args.note) + ':' + String(args.count) },
+    })
+
     let counter = 0
     const exec = command => agent.ctx.tools.execute({
       callId: 'objects-' + String(++counter),
@@ -243,6 +261,42 @@ export function apply(ctx) {
 
     const driftRefresh = textOf(await exec('$t = Get-DshTool -Name probe_drift' + NL + '$t = $t.Refresh()' + NL + '$t.Invoke(@{ note = \'two\' })'))
     record('drift.refresh_then_call_succeeds', driftRefresh.includes('DRIFT-2:two'), driftRefresh.slice(0, 300))
+
+    // --- declared parameters -------------------------------------------------
+    // The harness ignores an argument name that no parameter declares, so such a
+    // typo would call the tool with the rest of the object and look successful.
+    // The bridge rejects it instead, and a raised failure prints its reason
+    // before the block stops (the command wrapper swallows the terminating
+    // error, so the exit code alone would carry no reason).
+    const ignored = textOf(await exec([
+      '$t = Get-DshTool -Name probe_declared',
+      "$r = $t.Invoke(@{ note = 'ok'; count = 2; output_mode = 'content' })",
+      "'IGNORED-CALL=' + $r.Value",
+    ].join(NL)))
+    report.results.ignored = ignored.slice(0, 500)
+    record('parameters.undeclared_name_is_reported',
+      ignored.includes('[dsh] WARNING probe_declared ignores undeclared argument(s): output_mode') && ignored.includes('IGNORED-CALL=ok:2'),
+      report.results.ignored)
+
+    const declaredCall = textOf(await exec([
+      '$t = Get-DshTool -Name probe_declared',
+      "$r = $t.Invoke(@{ note = 'ok'; count = 2 })",
+      "'DECLARED-CALL=' + $r.Value",
+    ].join(NL)))
+    record('parameters.declared_names_still_execute', declaredCall.includes('DECLARED-CALL=ok:2') && !declaredCall.includes('WARNING'), declaredCall.slice(0, 200))
+
+    // A raised failure stops the block, and the command wrapper swallows its
+    // terminating error, so the preset prints the reason as one line first.
+    const notice = textOf(await exec([
+      '$read = Get-DshTool -Name read',
+      "$read.Invoke(@{ file_path = 'does-not-exist.txt' })",
+      "'NOT-REACHED'",
+    ].join(NL)))
+    report.results.notice = notice.slice(0, 500)
+    record('failure.raised_failure_prints_its_reason',
+      notice.includes('[dsh] FAILED read') && notice.includes('code=FS_NOT_FOUND') && !notice.includes('NOT-REACHED'),
+      report.results.notice)
+    disposeDeclared()
 
     // --- the prompt's worked example, executed verbatim ----------------------
     writeFileSync(path.join(dir, 'orders.json'), JSON.stringify([

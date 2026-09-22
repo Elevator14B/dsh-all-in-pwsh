@@ -628,6 +628,157 @@ function Get-DshToolSchema {
     return (Get-DshTool -Name $Name).InputSchema
 }
 
+function New-DshCliEnvelopeFailure {
+    <#
+    .SYNOPSIS
+    One failure object for a bridge-envelope refusal.
+
+    .DESCRIPTION
+    A refusal carries a string error and a stable code. Codes that describe the
+    host's own control flow are reported as kind Host; every other refusal is a
+    bridge-level failure. Both are failures that never reached a tool execution.
+
+    .PARAMETER Tool
+    The tool name the call was made for.
+
+    .PARAMETER Reply
+    The decoded refusal reply.
+
+    .RETURNS
+    The DshToolResult describing the refusal.
+    #>
+    [CmdletBinding()]
+    [OutputType([DshToolResult])]
+    param(
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Reply
+    )
+
+    $code = if ($Reply.Contains('code')) { [string]$Reply['code'] } else { $null }
+    $hostControl = $code -in @('IDENTITY_REVOKED', 'EXECUTION_ENDED', 'NO_CALL_IN_FLIGHT', 'NO_EXECUTION_IDENTITY', 'INSTANCE_MISMATCH', 'BAD_TOKEN')
+    return (New-DshToolFailure -Tool $Tool -Kind $(if ($hostControl) { 'Host' } else { 'Bridge' }) -Code $code -Message ([string]$Reply['error']) -Outcome 'not-executed')
+}
+
+function Write-DshCliFailureNotice {
+    <#
+    .SYNOPSIS
+    Print the failure a raised call is about to hide.
+
+    .DESCRIPTION
+    Under the session's Stop policy a raised failure ends the statement, and the
+    command wrapper that runs the shell catches that terminating error before it
+    can render, so the block would otherwise report only an exit code. This
+    writes one diagnostic line to the terminal first, including the tool, the
+    structured kind and code, the parameter path and the message. The line goes
+    to the error stream of the console rather than a PowerShell stream, so a
+    caller assigning a result can never capture it as data.
+
+    TryInvoke owns its failures and does not reach here; host control flow that
+    is raised even from TryInvoke does.
+
+    .PARAMETER Result
+    The failed DshToolResult about to be raised.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][DshToolResult]$Result
+    )
+
+    $failure = $Result.Error
+    $fields = @('kind=' + [string]$failure['kind'])
+    if (-not [string]::IsNullOrEmpty([string]$failure['code'])) { $fields += 'code=' + [string]$failure['code'] }
+    if (-not [string]::IsNullOrEmpty([string]$failure['parameterPath'])) { $fields += 'parameter=' + [string]$failure['parameterPath'] }
+    if ($null -ne $Result.Metadata) { $fields += 'outcome=' + [string]$Result.Metadata['outcome'] }
+    $message = ([string]$failure['message']) -replace '\s+', ' '
+    $message = $message.Trim()
+    if ([string]::IsNullOrWhiteSpace($message)) { $message = 'the call failed' }
+    if ($message.Length -gt 600) { $message = $message.Substring(0, 600) + ' ...' }
+    [Console]::Error.WriteLine('[dsh] FAILED ' + [string]$failure['tool'] + ' (' + ($fields -join ', ') + '): ' + $message)
+}
+
+function Get-DshCliDeclaredParameterNames {
+    <#
+    .SYNOPSIS
+    The parameter names a tool's input schema declares, or $null when there is
+    nothing to report.
+
+    .DESCRIPTION
+    The harness compiles a tool's DSL parameters into an implicitly open object
+    root, so a name the schema does not declare is ignored rather than rejected.
+    A schema that declares no properties, or one that closes its root with
+    additionalProperties false (where the harness itself rejects the call),
+    reports $null.
+
+    .PARAMETER Schema
+    The tool handle's InputSchema.
+
+    .RETURNS
+    The declared top-level names in schema order, or $null.
+    #>
+    [CmdletBinding()]
+    param([Parameter()][AllowNull()][object]$Schema)
+
+    if ($null -eq $Schema -or -not ($Schema -is [System.Collections.IDictionary])) { return $null }
+    if (-not $Schema.Contains('properties')) { return $null }
+    if ($Schema.Contains('additionalProperties') -and $Schema['additionalProperties'] -eq $false) { return $null }
+    $properties = $Schema['properties']
+    if ($null -eq $properties -or -not ($properties -is [System.Collections.IDictionary])) { return $null }
+    return @($properties.Keys | ForEach-Object { [string]$_ })
+}
+
+function Get-DshCliArgumentNames {
+    <#
+    .SYNOPSIS
+    The top-level names of one validated argument object.
+
+    .PARAMETER Value
+    The argument object the caller passed, in its original form.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter()][AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return @() }
+    if ($Value -is [System.Collections.IDictionary]) { return @($Value.Keys | ForEach-Object { [string]$_ }) }
+    return @($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+}
+
+function Write-DshCliIgnoredArgumentNotice {
+    <#
+    .SYNOPSIS
+    Report argument names the tool's schema does not declare and the harness
+    therefore ignores.
+
+    .DESCRIPTION
+    An undeclared name is dropped silently by the harness, so the call looks as
+    if the argument applied: a caller that asks for filtering and gets an
+    unfiltered result cannot tell why. This prints one warning line naming the
+    ignored and the declared names. The call still runs exactly as the harness
+    defines it; the preset does not turn tolerance into rejection.
+
+    .PARAMETER Tool
+    The tool the call was made for.
+
+    .PARAMETER Schema
+    The tool handle's InputSchema.
+
+    .PARAMETER Arguments
+    The validated argument object, in its original form.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Tool,
+        [Parameter()][AllowNull()][object]$Schema,
+        [Parameter()][AllowNull()][object]$Arguments
+    )
+
+    $declared = Get-DshCliDeclaredParameterNames -Schema $Schema
+    if ($null -eq $declared -or $declared.Count -eq 0) { return }
+    $ignored = @(Get-DshCliArgumentNames -Value $Arguments | Where-Object { $declared -notcontains $_ })
+    if ($ignored.Count -eq 0) { return }
+    [Console]::Error.WriteLine('[dsh] WARNING ' + $Tool + ' ignores undeclared argument(s): ' + ($ignored -join ', ') + ' (declared: ' + ($declared -join ', ') + ')')
+}
+
 function Invoke-DshToolObject {
     <#
     .SYNOPSIS
@@ -651,21 +802,25 @@ function Invoke-DshToolObject {
     # flow: it is raised even from TryInvoke, so a script cannot branch past it.
     if (-not [string]::IsNullOrEmpty($Tool.Instance) -and $Tool.Instance -ne $currentInstance) {
         $message = "The tool object for '$($Tool.Name)' belongs to bridge instance $($Tool.Instance), but this shell is running under instance $currentInstance. A tool object is reusable across blocks of the session that created it and across no other; obtain a fresh object with Get-DshTool -Name $($Tool.Name)."
+        $failure = New-DshToolFailure -Tool $Tool.Name -Kind 'Host' -Code 'HANDLE_INSTANCE_MISMATCH' -Message $message -Outcome 'not-executed'
+        Write-DshCliFailureNotice -Result $failure
         $record = [System.Management.Automation.ErrorRecord]::new(
             [System.InvalidOperationException]::new($message),
             'DshTool.Host.HANDLE_INSTANCE_MISMATCH',
             [System.Management.Automation.ErrorCategory]::ConnectionError,
-            (New-DshToolFailure -Tool $Tool.Name -Kind 'Host' -Code 'HANDLE_INSTANCE_MISMATCH' -Message $message -Outcome 'not-executed'))
+            $failure)
         $PSCmdlet.ThrowTerminatingError($record)
     }
     $currentSession = [string]$env:DSH_SESSION_ID
     if (-not [string]::IsNullOrEmpty($Tool.SessionId) -and $Tool.SessionId -ne $currentSession) {
         $message = "The tool object for '$($Tool.Name)' belongs to session $($Tool.SessionId), but this shell is running in session $currentSession. A tool object is reusable across blocks of the session that created it and across no other; obtain a fresh object with Get-DshTool -Name $($Tool.Name)."
+        $failure = New-DshToolFailure -Tool $Tool.Name -Kind 'Host' -Code 'HANDLE_SESSION_MISMATCH' -Message $message -Outcome 'not-executed'
+        Write-DshCliFailureNotice -Result $failure
         $record = [System.Management.Automation.ErrorRecord]::new(
             [System.InvalidOperationException]::new($message),
             'DshTool.Host.HANDLE_SESSION_MISMATCH',
             [System.Management.Automation.ErrorCategory]::ConnectionError,
-            (New-DshToolFailure -Tool $Tool.Name -Kind 'Host' -Code 'HANDLE_SESSION_MISMATCH' -Message $message -Outcome 'not-executed'))
+            $failure)
         $PSCmdlet.ThrowTerminatingError($record)
     }
 
@@ -676,9 +831,18 @@ function Invoke-DshToolObject {
         $validated = Test-DshCliArguments -Value $Arguments
     }
     catch {
-        if ($Raise) { throw }
-        return (New-DshToolFailure -Tool $Tool.Name -Kind 'Bridge' -Code 'INVALID_ARGUMENTS' -Message $_.Exception.Message -ParameterPath 'arguments' -Outcome 'not-executed')
+        $failure = New-DshToolFailure -Tool $Tool.Name -Kind 'Bridge' -Code 'INVALID_ARGUMENTS' -Message $_.Exception.Message -ParameterPath 'arguments' -Outcome 'not-executed'
+        if ($Raise) {
+            Write-DshCliFailureNotice -Result $failure
+            throw
+        }
+        return $failure
     }
+    # An undeclared name is dropped silently by the harness, so report it before
+    # the call runs: an ignored filter is otherwise indistinguishable from a
+    # filter that matched nothing.
+    Write-DshCliIgnoredArgumentNotice -Tool $Tool.Name -Schema $Tool.InputSchema -Arguments $validated
+
     $payload = [ordered]@{
         op        = 'call'
         name      = $Tool.Name
@@ -702,6 +866,7 @@ function Invoke-DshToolObject {
         # This stays a result for TryInvoke, never a silent success.
         $result = New-DshToolFailure -Tool $Tool.Name -Kind 'Bridge' -Code 'BRIDGE_UNREACHABLE' -Message $transportFailure.Exception.Message -Outcome 'unknown'
         if (-not $Raise) { return $result }
+        Write-DshCliFailureNotice -Result $result
         throw [System.Net.Http.HttpRequestException]::new($result.Error['message'], $transportFailure.Exception)
     }
 
@@ -709,13 +874,14 @@ function Invoke-DshToolObject {
     # a call reply always carries "ok" and its own structured error object, so a
     # tool failure is never mistaken for a transport refusal.
     if ((Test-DshCliEnvelopeRefusal -Reply $reply)) {
-        $code = if ($reply.Contains('code')) { [string]$reply['code'] } else { $null }
         # Host control flow - a revoked capability, an expired execution, a
         # foreign bridge - is not an ordinary recoverable failure: it is raised
         # even from TryInvoke so a script cannot branch past it.
-        $hostControl = $code -in @('IDENTITY_REVOKED', 'EXECUTION_ENDED', 'NO_CALL_IN_FLIGHT', 'NO_EXECUTION_IDENTITY', 'INSTANCE_MISMATCH', 'BAD_TOKEN')
-        $result = New-DshToolFailure -Tool $Tool.Name -Kind $(if ($hostControl) { 'Host' } else { 'Bridge' }) -Code $code -Message ([string]$reply['error']) -Outcome 'not-executed'
+        $result = New-DshCliEnvelopeFailure -Tool $Tool.Name -Reply $reply
+        $code = $result.Error['code']
+        $hostControl = $result.Error['kind'] -eq 'Host'
         if ($hostControl -or $Raise) {
+            Write-DshCliFailureNotice -Result $result
             $record = [System.Management.Automation.ErrorRecord]::new(
                 [System.InvalidOperationException]::new($result.Error['message']),
                 "DshTool.$($result.Error['kind']).$code",
@@ -730,6 +896,7 @@ function Invoke-DshToolObject {
     if (-not $result.Ok -and $Raise) {
         $message = [string]$result.Error['message']
         if ([string]::IsNullOrWhiteSpace($message)) { $message = "the call to '$($Tool.Name)' failed" }
+        Write-DshCliFailureNotice -Result $result
         $record = [System.Management.Automation.ErrorRecord]::new(
             [System.InvalidOperationException]::new($message),
             "DshTool.$($result.Error['kind'])",
@@ -781,12 +948,14 @@ function Invoke-DshTool {
     $reply = Invoke-DshCliRpc -Payload $payload
     if ((Test-DshCliEnvelopeRefusal -Reply $reply)) {
         $message = [string]$reply['error']
+        Write-DshCliFailureNotice -Result (New-DshCliEnvelopeFailure -Tool $Name -Reply $reply)
         throw [System.InvalidOperationException]::new($message)
     }
     $result = New-DshToolResult -Reply $reply -Tool $Name
     if (-not $result.Ok) {
         $message = [string]$result.Error['message']
         if ([string]::IsNullOrWhiteSpace($message)) { $message = "the call to '$Name' failed" }
+        Write-DshCliFailureNotice -Result $result
         $record = [System.Management.Automation.ErrorRecord]::new(
             [System.InvalidOperationException]::new($message),
             "DshTool.$($result.Error['kind'])",

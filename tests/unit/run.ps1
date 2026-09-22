@@ -537,6 +537,51 @@ $objectModel = & $module {
     $out['invokeRaised'] = $raised
     $out['raisedCarriesResult'] = $raisedTargetIsResult
 
+    # A raised failure ends the statement, and the command wrapper that runs the
+    # shell catches the terminating error before it renders, so the block would
+    # show only an exit code. Invoke therefore prints one diagnostic line to the
+    # console error stream first; TryInvoke owns its failure and prints nothing.
+    $noticeWriter = [System.IO.StringWriter]::new()
+    $savedConsoleError = [Console]::Error
+    try {
+        [Console]::SetError($noticeWriter)
+        try { $null = $tool.Invoke(@{ file_path = 'missing.txt' }) } catch { }
+        $out['invokeNotice'] = $noticeWriter.ToString().Trim()
+        $null = $noticeWriter.GetStringBuilder().Clear()
+        $null = $tool.TryInvoke(@{ file_path = 'missing.txt' })
+        $out['tryInvokeNotice'] = $noticeWriter.ToString().Trim()
+
+        # Host control flow is raised even from TryInvoke, so it prints there too.
+        $script:replyMode = 'refusal'
+        try { $null = $tool.TryInvoke(@{ file_path = 'orders.json' }) } catch { }
+        $out['refusalNotice'] = $noticeWriter.ToString().Trim()
+    }
+    finally { [Console]::SetError($savedConsoleError) }
+
+    # An argument name the schema does not declare is ignored by the harness, so
+    # the preset reports it and still runs the call. A schema that closes its
+    # root is the harness's own rejection, so no warning is printed there.
+    $script:replyMode = 'success'
+    $warningWriter = [System.IO.StringWriter]::new()
+    $savedConsoleError = [Console]::Error
+    $originalSchema = $script:toolDetail['inputSchema']
+    try {
+        [Console]::SetError($warningWriter)
+        $callsBeforeWarning = $script:rpcCalls
+        $openCall = $tool.Invoke(@{ file_path = 'orders.json'; output_mode = 'content' })
+        $out['ignoredWarning'] = $warningWriter.ToString().Trim()
+        $out['ignoredCallRan'] = (($script:rpcCalls -gt $callsBeforeWarning) -and $openCall.Ok)
+        $null = $warningWriter.GetStringBuilder().Clear()
+        $script:toolDetail['inputSchema'] = @{ type = 'object'; additionalProperties = $false; properties = [ordered]@{ file_path = @{ type = 'string' } }; required = @('file_path') }
+        $closedHandle = Get-DshTool -Name read
+        $null = $closedHandle.Invoke(@{ file_path = 'orders.json'; output_mode = 'content' })
+        $out['closedSchemaWarning'] = $warningWriter.ToString().Trim()
+    }
+    finally {
+        $script:toolDetail['inputSchema'] = $originalSchema
+        [Console]::SetError($savedConsoleError)
+    }
+
     $script:replyMode = 'drift'
     $driftRaised = $false
     $driftMessage = ''
@@ -658,6 +703,14 @@ Assert-That 'objects.status_line_names_tool_and_outcome' ($objectModel['statusLi
 Assert-That 'objects.metadata_is_present' ($objectModel['metadataTool'] -eq 'read' -and $objectModel['metadataOutcome'] -eq 'settled') ($objectModel['metadataTool'] + '/' + $objectModel['metadataOutcome'])
 Assert-That 'objects.tryinvoke_returns_failure' ((-not $objectModel['failedOk']) -and $objectModel['failedKind'] -eq 'Tool' -and $objectModel['failedCode'] -eq 'FS_NOT_FOUND' -and (-not $objectModel['failedHasValue'])) ($objectModel['failedKind'] + '/' + $objectModel['failedCode'])
 Assert-That 'objects.invoke_raises_and_carries_result' ($objectModel['invokeRaised'] -and $objectModel['raisedCarriesResult'])
+$invokeNotice = [string]$objectModel['invokeNotice']
+Assert-That 'objects.invoke_prints_the_failure_before_raising' ($invokeNotice.StartsWith('[dsh] FAILED read') -and $invokeNotice.Contains('code=FS_NOT_FOUND') -and $invokeNotice.Contains('cannot read missing.txt')) $invokeNotice
+Assert-That 'objects.tryinvoke_prints_no_failure_notice' ([string]::IsNullOrEmpty([string]$objectModel['tryInvokeNotice'])) $objectModel['tryInvokeNotice']
+$ignoredWarning = [string]$objectModel['ignoredWarning']
+Assert-That 'objects.undeclared_argument_is_reported_not_rejected' ($ignoredWarning.StartsWith('[dsh] WARNING read ignores undeclared argument(s): output_mode') -and $objectModel['ignoredCallRan']) $ignoredWarning
+Assert-That 'objects.closed_schema_defers_to_the_harness' ([string]::IsNullOrEmpty([string]$objectModel['closedSchemaWarning'])) $objectModel['closedSchemaWarning']
+$refusalNotice = [string]$objectModel['refusalNotice']
+Assert-That 'objects.host_control_flow_prints_its_notice' ($refusalNotice.StartsWith('[dsh] FAILED read') -and $refusalNotice.Contains('kind=Host') -and $refusalNotice.Contains('code=IDENTITY_REVOKED')) $refusalNotice
 Assert-That 'objects.definition_drift_names_refresh' ($objectModel['driftRaised'] -and $objectModel['driftMentionsRefresh'])
 Assert-That 'objects.identity_refusal_is_a_host_kind' ($objectModel['refusalThrew'] -and $objectModel['refusalKind'] -eq 'Host' -and $objectModel['refusalCode'] -eq 'IDENTITY_REVOKED') ($objectModel['refusalKind'] + '/' + $objectModel['refusalCode'])
 Assert-That 'objects.handle_binds_its_creating_session' ($objectModel['handleSession'] -eq 'unit-session') $objectModel['handleSession']

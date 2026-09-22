@@ -117,7 +117,7 @@ tests/integration/...             needs the real DSH runtime
 
 ## Troubleshooting
 
-Failures are structured. `$result.Ok` is false and `$result.Error` names the group:
+Failures are structured. `$result.Ok` is false and `$result.Error` names the group, and a raised failure prints one `[dsh] FAILED <tool> (kind=..., code=..., parameter=...): <message>` line before the block stops, so the reason stays visible even though the command wrapper swallows the terminating error: 
 
 1. **Invalid arguments** (`kind = Bridge` before any request, or thrown by the module): a `DateTime` instead of an ISO-8601 string, a non-string dictionary key, a cycle, or nesting past the 48-level JSON budget. The message names the parameter path and the offending type.
 2. **Bridge or host refusals** (`kind = Bridge` or `kind = Host`): the bridge is unreachable, the execution identity is missing or revoked (`IDENTITY_REVOKED`), the tool object belongs to another bridge instance or session (`HANDLE_INSTANCE_MISMATCH` / `HANDLE_SESSION_MISMATCH`), or the definition changed (`kind = DefinitionChanged`, which names `Refresh()`). A connection failure after dispatch is reported with `Metadata.outcome = 'unknown'`: the operation may or may not have taken effect, and it is never retried automatically.
@@ -127,6 +127,8 @@ Other symptoms:
 
 - **`dsh-all-in-pwsh is not active in this shell`** - the command is not running inside a preset shell call, for example a background job started by an earlier command. Run it in the foreground.
 - **A dependent write ran after a failed call** - the shell's error policy was relaxed. The preset sets `$ErrorActionPreference = 'Stop'` at startup; a script that sets `Continue` gives up the stop guarantee and should use `TryInvoke`.
+- **A block stops with only an exit code** - every raised failure prints its `[dsh] FAILED ...` reason line first, and that line, not the exit code, is the diagnosis. A native command that fails inside the block still reports through its own stderr and `$LASTEXITCODE`.
+- **An argument seems to have no effect** - the harness compiles a plugin's parameters into an implicitly open object root, so a name the tool's `InputSchema` does not declare is ignored rather than rejected. The preset prints `[dsh] WARNING <tool> ignores undeclared argument(s): <names> (declared: <names>)` before the call runs and still executes the call. A tool that closes its root with `additionalProperties: false` is rejected by the harness itself, which the failure line above reports.
 - **The preset is missing from the picker** - check that `<DSH home>/.agent-presets/dsh-all-in-pwsh/agent.cordis.yml` exists and that the host resolves `<DSH home>` the way you expect (`DSH_HOME`).
 - **The preset fails to mount** - the mount error names the row. The usual cause is a DSH build older than the extension points listed above.
 - **`Get-Command dsh-tool` reports Application instead of Alias** - a different `dsh-tool` is on `PATH`. Remove it; the module alias should win inside the preset shell.
